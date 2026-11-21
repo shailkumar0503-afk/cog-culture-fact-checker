@@ -5,9 +5,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from groq import APIConnectionError, APIStatusError, Groq
+
 from checker import CheckError, extract_claims, normalized
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TAVILY_URL = "https://api.tavily.com/search"
 GROQ_MODEL = "openai/gpt-oss-20b"
 
@@ -47,26 +48,47 @@ VERDICT = _record({
 })
 
 
+def _groq_status_message(status, body):
+    error = body.get("error", body) if isinstance(body, dict) else {}
+    code = error.get("code") if isinstance(error, dict) else None
+    if status == 403:
+        if code == "model_permission_blocked_org":
+            return "Groq organization settings block the model. Ask the organization owner to check Model Permissions."
+        if code == "model_permission_blocked_project":
+            return "Groq project settings block the model. Check Model Permissions for the project that owns the API key."
+        return "Groq denied this API request (403). Check API access for the key's project or contact Groq support."
+    return {
+        400: "Groq rejected the model request (400).",
+        401: "Groq did not accept the API key (401).",
+        429: "Groq is rate-limited or out of credits (429).",
+    }.get(status, f"Groq returned an API error (HTTP {status}).")
+
+
 def _groq(key, instructions, data, schema, name):
-    result = _post(GROQ_URL, key, {
-        "model": GROQ_MODEL, "reasoning_effort": "low", "max_completion_tokens": 2200,
-        "messages": [{"role": "system", "content": instructions},
-                     {"role": "user", "content": json.dumps(data, ensure_ascii=False)}],
-        "response_format": {"type": "json_schema", "json_schema": {
-            "name": name, "strict": True, "schema": schema,
-        }},
-    }, "Groq")
     try:
-        choice = result["choices"][0]
-        if choice["finish_reason"] != "stop":
+        with Groq(api_key=key, timeout=40.0, max_retries=0) as client:
+            result = client.chat.completions.create(
+                model=GROQ_MODEL, reasoning_effort="low", max_completion_tokens=2200,
+                messages=[{"role": "system", "content": instructions},
+                          {"role": "user", "content": json.dumps(data, ensure_ascii=False)}],
+                response_format={"type": "json_schema", "json_schema": {
+                    "name": name, "strict": True, "schema": schema,
+                }},
+            )
+    except APIStatusError as exc:
+        raise CheckError(_groq_status_message(exc.status_code, exc.body) + " No verdict was assigned.") from None
+    except APIConnectionError:
+        raise CheckError("Groq did not respond. Try again. No verdict was assigned.") from None
+    try:
+        choice = result.choices[0]
+        if choice.finish_reason != "stop":
             raise ValueError("incomplete model response")
-        raw = choice["message"]["content"]
-        parsed = json.loads(raw)
+        parsed = json.loads(choice.message.content)
         if not isinstance(parsed, dict):
             raise ValueError("invalid JSON object")
         return parsed
-    except (ValueError, KeyError, IndexError, TypeError) as exc:
-        raise CheckError("Groq returned an incomplete or unreadable result. Try again.") from exc
+    except (ValueError, AttributeError, IndexError, TypeError):
+        raise CheckError("Groq returned an incomplete or unreadable result. Try again.") from None
 
 
 def extract_with_groq(pages, groq_key):
