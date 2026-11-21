@@ -106,6 +106,9 @@ def render_review(review):
                 st.caption("This source indicates a mismatch, but no replacement was substantiated.")
             st.markdown("**Evidence**" if row["sources"] else "**Why this result**")
             st.text(row["explanation"])
+            if row.get("evidence_excerpt"):
+                st.caption("Retrieved source passage")
+                st.text(row["evidence_excerpt"])
             for url, title in row["sources"].items():
                 st.link_button(title, url)
 

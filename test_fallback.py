@@ -14,7 +14,7 @@ CLAIM = {"claim": "A meeting took place in July 1969.", "page": 1,
 EVIDENCE = {"results": [{"url": "https://example.org/source", "title": "Archive",
                          "content": "A meeting took place in July 1969 and was recorded."}]}
 VERDICT = {"verdict": "Verified", "explanation": "The archive gives the same date.",
-           "correction": "", "evidence_id": 1, "evidence_quote": "A meeting took place in July 1969"}
+           "correction": "", "passage_id": 1}
 
 
 def groq(obj):
@@ -41,43 +41,40 @@ class FallbackTests(unittest.TestCase):
         post.assert_called_once()
         groq_.assert_called_once()
 
-    @patch("fallback._groq", return_value={**VERDICT, "evidence_quote": "A made-up excerpt."})
     @patch("fallback._post", return_value=EVIDENCE)
-    def test_wrong_quote_does_not_assign_verdict(self, _, __):
-        with self.assertRaises(CheckError):
-            check_with_groq_tavily(CLAIM, "example", "example")
-
-    @patch("fallback._post", return_value=EVIDENCE)
-    def test_retries_mismatch_against_same_sources(self, post):
-        incorrect = {**VERDICT, "evidence_quote": "A paraphrase that is not in the source text."}
-        grounded = {**VERDICT, "evidence_quote": '“A MEETING took place in July 1969”'}
-        with patch("fallback._groq", side_effect=[incorrect, grounded]) as judge:
-            result = check_with_groq_tavily(CLAIM, "example", "example")
-        self.assertEqual(result["verdict"], "Verified")
-        self.assertEqual(result["sources"], {"https://example.org/source": "Archive"})
-        self.assertEqual(judge.call_count, 2)
-        self.assertEqual(judge.call_args.args[2]["previous_selected_source_id"], 1)
-        post.assert_called_once()
-
-    def test_recovers_unique_actual_source_but_not_ambiguous_source(self):
-        wrong = {"url": "https://example.org/unrelated", "title": "Unrelated", "content": "Unrelated source."}
-        good = EVIDENCE["results"][0]
-        with patch("fallback._groq", return_value=VERDICT) as judge:
-            with patch("fallback._post", return_value={"results": [wrong, good]}):
-                result = check_with_groq_tavily(CLAIM, "example", "example")
-            self.assertEqual(result["sources"], {"https://example.org/source": "Archive"})
-            judge.assert_called_once()
-            with patch("fallback._post", return_value={"results": [wrong, good,
-                      {**good, "url": "https://example.org/duplicate"}]}):
-                with self.assertRaisesRegex(CheckError, "could not tie"):
-                    check_with_groq_tavily(CLAIM, "example", "example")
-
-    @patch("fallback._post", return_value=EVIDENCE)
-    def test_correction_date_mutation_cannot_be_grounded(self, _):
-        incorrect = {**VERDICT, "evidence_quote": "A meeting took place in July 1968"}
-        with patch("fallback._groq", return_value=incorrect):
+    def test_invalid_id_does_not_assign_verdict(self, _):
+        with patch("fallback._groq", return_value={**VERDICT, "passage_id": 999}) as judge:
             with self.assertRaisesRegex(CheckError, "could not tie"):
                 check_with_groq_tavily(CLAIM, "example", "example")
+        self.assertEqual(judge.call_count, 2)
+
+    @patch("fallback._post", return_value=EVIDENCE)
+    def test_retries_invalid_id_and_quotes_exact_passage(self, post):
+        with patch("fallback._groq", side_effect=[{**VERDICT, "passage_id": 99}, VERDICT]) as judge:
+            result = check_with_groq_tavily(CLAIM, "example", "example")
+        self.assertEqual(result["verdict"], "Verified")
+        self.assertEqual(result["evidence_excerpt"], EVIDENCE["results"][0]["content"])
+        self.assertEqual(result["sources"], {"https://example.org/source": "Archive"})
+        self.assertEqual(judge.call_count, 2)
+        self.assertNotIn("url", judge.call_args.args[2]["passages"][0])
+        post.assert_called_once()
+
+    @patch("fallback._groq", return_value=VERDICT)
+    def test_unrelated_passage_is_not_a_verdict(self, _):
+        wrong = {"url": "https://example.org/unrelated", "title": "Unrelated",
+                 "content": "A plastic spoon was placed next to the unattended desk."}
+        with patch("fallback._post", return_value={"results": [wrong]}):
+            with self.assertRaisesRegex(CheckError, "could not tie"):
+                check_with_groq_tavily(CLAIM, "example", "example")
+
+    def test_second_extraction_recovers_non_numeric_status(self):
+        missed = {"page": 1, "quote": "NASA has yet to bring a sample of asteroid Bennu back to Earth.",
+                  "claim": "NASA has not yet returned a Bennu sample to Earth."}
+        with patch("fallback._groq", side_effect=[{"claims": [CLAIM]}, {"claims": [missed]}]) as judge:
+            got = extract_with_groq({1: CLAIM["quote"] + " " + missed["quote"]}, "example")
+        self.assertEqual(got, [CLAIM, missed])
+        self.assertEqual(judge.call_count, 2)
+        self.assertNotIn(CLAIM["quote"], judge.call_args.args[2][1])
 
     @patch("fallback._post")
     def test_empty_search_has_no_support(self, post):
