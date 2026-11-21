@@ -47,6 +47,38 @@ class FallbackTests(unittest.TestCase):
         with self.assertRaises(CheckError):
             check_with_groq_tavily(CLAIM, "example", "example")
 
+    @patch("fallback._post", return_value=EVIDENCE)
+    def test_retries_mismatch_against_same_sources(self, post):
+        incorrect = {**VERDICT, "evidence_quote": "A paraphrase that is not in the source text."}
+        grounded = {**VERDICT, "evidence_quote": '“A MEETING took place in July 1969”'}
+        with patch("fallback._groq", side_effect=[incorrect, grounded]) as judge:
+            result = check_with_groq_tavily(CLAIM, "example", "example")
+        self.assertEqual(result["verdict"], "Verified")
+        self.assertEqual(result["sources"], {"https://example.org/source": "Archive"})
+        self.assertEqual(judge.call_count, 2)
+        self.assertEqual(judge.call_args.args[2]["previous_selected_source_id"], 1)
+        post.assert_called_once()
+
+    def test_recovers_unique_actual_source_but_not_ambiguous_source(self):
+        wrong = {"url": "https://example.org/unrelated", "title": "Unrelated", "content": "Unrelated source."}
+        good = EVIDENCE["results"][0]
+        with patch("fallback._groq", return_value=VERDICT) as judge:
+            with patch("fallback._post", return_value={"results": [wrong, good]}):
+                result = check_with_groq_tavily(CLAIM, "example", "example")
+            self.assertEqual(result["sources"], {"https://example.org/source": "Archive"})
+            judge.assert_called_once()
+            with patch("fallback._post", return_value={"results": [wrong, good,
+                      {**good, "url": "https://example.org/duplicate"}]}):
+                with self.assertRaisesRegex(CheckError, "could not tie"):
+                    check_with_groq_tavily(CLAIM, "example", "example")
+
+    @patch("fallback._post", return_value=EVIDENCE)
+    def test_correction_date_mutation_cannot_be_grounded(self, _):
+        incorrect = {**VERDICT, "evidence_quote": "A meeting took place in July 1968"}
+        with patch("fallback._groq", return_value=incorrect):
+            with self.assertRaisesRegex(CheckError, "could not tie"):
+                check_with_groq_tavily(CLAIM, "example", "example")
+
     @patch("fallback._post")
     def test_empty_search_has_no_support(self, post):
         post.return_value = {"results": []}

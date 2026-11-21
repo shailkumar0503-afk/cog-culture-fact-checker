@@ -1,5 +1,6 @@
 """Optional free-tier provider adapter. Search separately from verdict generation."""
 import json
+import unicodedata
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -107,7 +108,7 @@ def extract_with_groq(pages, groq_key):
 
 
 def _evidence(claim, key):
-    query = normalized(claim["quote"])[:350]
+    query = normalized(claim["quote"])[:320] + " official source"
     result = _post(TAVILY_URL, key, {"query": query, "search_depth": "basic",
                                     "max_results": 5, "include_answer": False,
                                     "auto_parameters": False}, "Tavily")
@@ -135,6 +136,41 @@ def _evidence(claim, key):
     return evidence
 
 
+_QUOTE_FORMAT = str.maketrans({
+    "’": "'", "‘": "'", "“": '"', "”": '"', "–": "—",
+    "\u200b": None, "\u00ad": None,
+})
+
+
+def _quote_form(text):
+    """Ignore casing, surrounding quotation marks, and harmless typography only."""
+    return normalized(unicodedata.normalize("NFC", text).translate(_QUOTE_FORMAT)).strip("\"'").casefold()
+
+
+def _grounded_result(result, evidence):
+    verdict, selected = result.get("verdict"), result.get("evidence_id")
+    quote, explanation, correction = (result.get(field) for field in ("evidence_quote", "explanation", "correction"))
+    if (verdict not in {"Verified", "Inaccurate"} or type(selected) is not int
+            or not 1 <= selected <= len(evidence)
+            or not all(isinstance(x, str) for x in (quote, explanation, correction))
+            or not explanation.strip()):
+        return None
+    source = evidence[selected - 1]
+    clean_quote = _quote_form(quote)
+    if len(clean_quote) < 14:
+        return None
+    if clean_quote not in _quote_form(source["snippet"]):
+        # A wrong numeric label can be recovered only when the model's
+        # exact (typography-normalized) quote appears in one other snippet.
+        candidates = [item for item in evidence if clean_quote in _quote_form(item["snippet"])]
+        if len(candidates) != 1:
+            return None
+        source = candidates[0]
+    return {"verdict": verdict, "explanation": normalized(explanation),
+            "correction": normalized(correction) if verdict == "Inaccurate" else "",
+            "sources": {source["url"]: source["title"]}}
+
+
 def check_with_groq_tavily(claim, groq_key, tavily_key):
     evidence = _evidence(claim, tavily_key)
     no_evidence = {"verdict": "False",
@@ -150,21 +186,32 @@ def check_with_groq_tavily(claim, groq_key, tavily_key):
         "Use Inaccurate when a source contradicts the claim; only supply a correction if directly supported. "
         "Use False when evidence is insufficient, with evidence_id 0 and empty evidence_quote and correction. "
         "Otherwise give one short explanation, one evidence_id from the supplied excerpts, and an exact "
-        "evidence_quote copied from that numbered snippet. Do not write URLs in any output field."
+        "evidence_quote copied from that numbered snippet. Copy one continuous clause containing the decisive "
+        "fact, ideally 15–150 characters. No paraphrase, joined fragments, omissions, or outer quotes. "
+        "Do not write URLs in any output field."
     )
-    result = _groq(groq_key, instructions, {"checked_on": datetime.now(timezone.utc).date().isoformat(),
-                                           "claim": claim, "evidence": evidence}, VERDICT, "pdf_verdict")
-    verdict = result.get("verdict")
-    if verdict == "False":
+    data = {"checked_on": datetime.now(timezone.utc).date().isoformat(),
+            "claim": claim, "evidence": evidence}
+    result = _groq(groq_key, instructions, data, VERDICT, "pdf_verdict")
+    if result.get("verdict") == "False":
         return no_evidence
+    grounded = _grounded_result(result, evidence)
+    if grounded is not None:
+        return grounded
+    # Retry once with the same retrieved evidence. Do not weaken the validator or
+    # treat a failed evidence match as proof that the claim has no support.
     selected = result.get("evidence_id")
-    quote, explanation, correction = (result.get(field) for field in ("evidence_quote", "explanation", "correction"))
-    if (verdict not in {"Verified", "Inaccurate"} or type(selected) is not int
-            or not 1 <= selected <= len(evidence) or not all(isinstance(x, str) for x in (quote, explanation, correction))
-            or not explanation.strip() or len(normalized(quote)) < 14
-            or normalized(quote) not in evidence[selected - 1]["snippet"]):
-        raise CheckError("The checker could not tie this verdict to a search excerpt. No verdict was assigned.")
-    source = evidence[selected - 1]
-    return {"verdict": verdict, "explanation": normalized(explanation),
-            "correction": normalized(correction) if verdict == "Inaccurate" else "",
-            "sources": {source["url"]: source["title"]}}
+    if type(selected) is int and 1 <= selected <= len(evidence):
+        data["previous_selected_source_id"] = selected
+    retry = _groq(
+        groq_key,
+        instructions + " The first citation did not match its excerpt. Redo the comparison from the "
+        "supplied text. Look at the previously selected source if provided, but use another if stronger. "
+        "Before finalizing, verify the quote is a single verbatim substring of the selected snippet "
+        "and contains the decisive date, number, or factual wording.",
+        data, VERDICT, "pdf_verdict",
+    )
+    grounded = _grounded_result(retry, evidence)
+    if grounded is not None:
+        return grounded
+    raise CheckError("The checker could not tie this verdict to a search excerpt. No verdict was assigned.")
